@@ -41,7 +41,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_go_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text("Отлично. Подскажи, как тебя зовут")
+    await q.message.reply_text("Отлично. Подскажи, как тебя зовут?")
     return ASK_NAME
 
 async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
