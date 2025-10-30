@@ -1,7 +1,13 @@
 import os
+import json
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    InputFile,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -11,22 +17,37 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import openpyxl
-from openpyxl import Workbook
 
+import gspread
+from google.oauth2.service_account import Credentials
+
+# -------- states --------
 WAIT_GO, ASK_NAME, ASK_COUNT = range(3)
-EXCEL_FILE = "participants.xlsx"
 
-def ensure_excel():
-    if not os.path.exists(EXCEL_FILE):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Записи"
-        ws.append(["Время", "Telegram ID", "Юзернейм", "Имя", "Количество"])
-        wb.save(EXCEL_FILE)
+# -------- Google Sheets setup --------
+def gs_client():
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON не задан")
+    info = json.loads(creds_json)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
 
-ensure_excel()
+def gs_worksheet():
+    sheet_id = os.environ.get("SHEET_ID", "").strip()
+    if not sheet_id:
+        raise RuntimeError("SHEET_ID не задан")
+    gc = gs_client()
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet("Записи")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Записи", rows=1000, cols=8)
+        ws.append_row(["Время", "Telegram ID", "Юзернейм", "Имя", "Количество"], value_input_option="RAW")
+    return ws
 
+# -------- handlers --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Добро пожаловать в регистрацию на Презентацию альбома и Birthday party by Damir Mate — 25 ноября!\n\n"
@@ -41,7 +62,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_go_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text("Отлично. Подскажи, как тебя зовут?")
+    await q.message.reply_text("Отлично. Подскажи, как тебя зовут")
     return ASK_NAME
 
 async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -66,14 +87,22 @@ async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_COUNT
 
     name = context.user_data.get("name", "").strip()
-
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
     user = update.effective_user
     tg_id = user.id if user else ""
     username = f"@{user.username}" if user and user.username else ""
-    ws.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tg_id, username, name, count])
-    wb.save(EXCEL_FILE)
+
+    # запись в Google Sheets
+    ws = gs_worksheet()
+    ws.append_row(
+        [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            tg_id,
+            username,
+            name,
+            count,
+        ],
+        value_input_option="RAW",
+    )
 
     msg4 = (
         f"Спасибо, {name}!\n\n"
@@ -97,7 +126,7 @@ async def on_kaif_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Там будут все новости по концерту — "
         "[тык](https://t.me/+xkFENZGOXv44N2Zi)"
     )
-    image_path = "poster.jpg"
+    image_path = "poster.jpg"  # положи файл рядом с bot.py (или убери, если не нужен)
     if os.path.exists(image_path):
         with open(image_path, "rb") as img:
             await q.message.reply_photo(photo=InputFile(img), caption=msg5, parse_mode="Markdown")
@@ -108,6 +137,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Регистрация отменена.")
     return ConversationHandler.END
 
+# -------- app --------
 def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
