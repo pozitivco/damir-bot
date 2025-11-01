@@ -25,18 +25,21 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Состояния диалога
+# ------------------------------------
+#  Константы и состояния
+# ------------------------------------
 WAIT_GO, ASK_NAME, ASK_COUNT = range(3)
-
-# Админы из переменной окружения
+BROADCAST_WAIT_CONTENT, BROADCAST_CONFIRM = range(1001, 1003)
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-# ---------------- Google Sheets ----------------
 
+# ------------------------------------
+#  Работа с Google Sheets
+# ------------------------------------
 def gs_client():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     if not creds_json:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON не задан")
+        raise RuntimeError("Не задан GOOGLE_CREDENTIALS_JSON")
     info = json.loads(creds_json)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
@@ -45,34 +48,30 @@ def gs_client():
 def gs_ws(sheet_name: str, headers: list):
     sheet_id = os.environ.get("SHEET_ID", "").strip()
     if not sheet_id:
-        raise RuntimeError("SHEET_ID не задан")
+        raise RuntimeError("Не задан SHEET_ID")
     gc = gs_client()
     sh = gc.open_by_key(sheet_id)
     try:
         ws = sh.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=max(8, len(headers)))
-        ws.append_row(headers, value_input_option="RAW")
+        ws.append_row(headers)
     return ws
 
 def add_subscriber(chat_id, username, first_name):
     ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
     existing = ws.col_values(1)
     if str(chat_id) not in existing:
-        ws.append_row(
-            [
-                str(chat_id),
-                username or "",
-                first_name or "",
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            ],
-            value_input_option="RAW",
-        )
+        ws.append_row([
+            str(chat_id),
+            username or "",
+            first_name or "",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ])
 
 def remove_subscriber(chat_id):
     ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
     cells = ws.findall(str(chat_id), in_column=1)
-    # если несколько записей по ошибке, удалим все
     for c in reversed(cells):
         ws.delete_rows(c.row)
 
@@ -81,8 +80,10 @@ def all_chat_ids():
     vals = ws.col_values(1)
     return [int(x) for x in vals[1:] if x.isdigit()]
 
-# ---------------- Меню команд ----------------
 
+# ------------------------------------
+#  Меню команд
+# ------------------------------------
 async def set_user_commands(app):
     commands = [
         BotCommand("start", "Регистрация на концерт"),
@@ -93,8 +94,9 @@ async def set_user_commands(app):
 
 async def set_admin_commands(app, admin_ids):
     commands = [
-        BotCommand("broadcast", "Рассылка всем подписчикам"),
-        BotCommand("stats", "Статистика подписчиков"),
+        BotCommand("broadcast", "Создать рассылку"),
+        BotCommand("stats", "Показать статистику подписчиков"),
+        BotCommand("cancel", "Отменить рассылку"),
     ]
     for aid in admin_ids:
         try:
@@ -106,14 +108,16 @@ async def post_init(app):
     await set_user_commands(app)
     await set_admin_commands(app, ADMIN_IDS)
 
-# ---------------- Хэндлеры пользователя ----------------
 
+# ------------------------------------
+#  Пользовательские функции
+# ------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
+    user = update.effective_user
     add_subscriber(
-        chat_id=u.id if u else 0,
-        username=f"@{u.username}" if u and u.username else "",
-        first_name=u.first_name if u else "",
+        chat_id=user.id if user else 0,
+        username=f"@{user.username}" if user and user.username else "",
+        first_name=user.first_name if user else "",
     )
 
     text = (
@@ -123,27 +127,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Кликни \"Я иду!\", чтобы зарегистрироваться"
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Я иду!", callback_data="go")]])
-    if update.message:
-        await update.message.reply_text(text, reply_markup=keyboard)
-    else:
-        await update.callback_query.message.reply_text(text, reply_markup=keyboard)
+    await update.message.reply_text(text, reply_markup=keyboard)
     return WAIT_GO
 
 async def on_go_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text("Отлично. Подскажи, как тебя зовут?")
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("Отлично. Подскажи, как тебя зовут")
     return ASK_NAME
 
 async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     context.user_data["name"] = name
-    text = (
+    await update.message.reply_text(
         f"Гуд, {name}! 🙌\n\n"
         "Сколько человек будет с тобой?\n"
         "(напиши число — если ты придёшь один/одна, то просто напиши «1»)"
     )
-    await update.message.reply_text(text)
     return ASK_COUNT
 
 async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,22 +156,16 @@ async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши, пожалуйста, целое положительное число. Пример: 1")
         return ASK_COUNT
 
-    name = context.user_data.get("name", "").strip()
+    name = context.user_data.get("name", "")
     user = update.effective_user
-    tg_id = user.id if user else ""
-    username = f"@{user.username}" if user and user.username else ""
-
     ws = gs_ws("Записи", ["Время", "Telegram ID", "Юзернейм", "Имя", "Количество"])
-    ws.append_row(
-        [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            tg_id,
-            username,
-            name,
-            count,
-        ],
-        value_input_option="RAW",
-    )
+    ws.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        user.id,
+        f"@{user.username}" if user.username else "",
+        name,
+        count,
+    ])
 
     msg4 = (
         f"Спасибо, {name}!\n\n"
@@ -195,117 +189,141 @@ async def on_kaif_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Там будут все новости по концерту — "
         "[тык](https://t.me/+xkFENZGOXv44N2Zi)"
     )
-    image_path = "poster.jpg"
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as img:
-            await q.message.reply_photo(photo=InputFile(img), caption=msg5, parse_mode="Markdown")
+    if os.path.exists("poster.jpg"):
+        with open("poster.jpg", "rb") as f:
+            await q.message.reply_photo(photo=InputFile(f), caption=msg5, parse_mode="Markdown")
     else:
         await q.message.reply_text(msg5, parse_mode="Markdown")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Помощь:\n"
-        "/start — регистрация на концерт\n"
-        "/unsubscribe — отписаться от уведомлений\n"
-        "Новости и анонсы приходят в рассылке."
-    )
 
-async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user:
-        remove_subscriber(user.id)
-    await update.message.reply_text("Ты отписан от уведомлений. Вернуть рассылку можно командой /start.")
-
-# ---------------- Админ-хэндлеры ----------------
-
-def _extract_broadcast_payload(msg):
-    if msg.caption and msg.caption.startswith("/broadcast"):
-        return msg.caption.partition(" ")[2].strip()
-    if msg.text and msg.text.startswith("/broadcast"):
-        return msg.text.partition(" ")[2].strip()
-    return ""
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------------------------
+#  3-шаговая рассылка с предпросмотром
+# ------------------------------------
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_IDS:
         return
+    await update.message.reply_text("Ок, прикрепи фото, видео или текст для рассылки. Пришли сообщение.")
+    return BROADCAST_WAIT_CONTENT
 
+async def broadcast_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    text_payload = _extract_broadcast_payload(msg)
-    if not any([msg.photo, msg.video, msg.document]) and not text_payload:
-        await msg.reply_text("Используй: /broadcast текст сообщения. Можно прикрепить фото/видео с подписью.")
-        return
+    kind, file_id = "text", None
+    caption = msg.caption or msg.text or " "
+
+    if msg.photo:
+        kind, file_id = "photo", msg.photo[-1].file_id
+    elif msg.video:
+        kind, file_id = "video", msg.video.file_id
+    elif msg.animation:
+        kind, file_id = "animation", msg.animation.file_id
+    elif msg.document:
+        kind, file_id = "document", msg.document.file_id
+
+    context.user_data.update({"kind": kind, "file_id": file_id, "caption": caption})
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Всё ок, выкладывай", callback_data="confirm_broadcast")],
+        [InlineKeyboardButton("✏️ Исправить", callback_data="edit_broadcast")],
+    ])
+
+    if kind == "photo":
+        await msg.reply_photo(file_id, caption=f"ПРЕДПРОСМОТР:\n\n{caption}", reply_markup=keyboard)
+    elif kind == "video":
+        await msg.reply_video(file_id, caption=f"ПРЕДПРОСМОТР:\n\n{caption}", reply_markup=keyboard)
+    elif kind == "animation":
+        await msg.reply_animation(file_id, caption=f"ПРЕДПРОСМОТР:\n\n{caption}", reply_markup=keyboard)
+    elif kind == "document":
+        await msg.reply_document(file_id, caption=f"ПРЕДПРОСМОТР:\n\n{caption}", reply_markup=keyboard)
+    else:
+        await msg.reply_text(f"ПРЕДПРОСМОТР:\n\n{caption}", reply_markup=keyboard)
+
+    return BROADCAST_CONFIRM
+
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    kind = context.user_data.get("kind")
+    file_id = context.user_data.get("file_id")
+    caption = context.user_data.get("caption")
 
     ids = all_chat_ids()
     sent, fail = 0, 0
 
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-        async def send_func(cid):
-            await context.bot.send_photo(chat_id=cid, photo=file_id, caption=text_payload or " ", parse_mode="Markdown")
-    elif msg.video:
-        file_id = msg.video.file_id
-        async def send_func(cid):
-            await context.bot.send_video(chat_id=cid, video=file_id, caption=text_payload or " ", parse_mode="Markdown")
-    elif msg.document:
-        file_id = msg.document.file_id
-        async def send_func(cid):
-            await context.bot.send_document(chat_id=cid, document=file_id, caption=text_payload or " ", parse_mode="Markdown")
-    else:
-        async def send_func(cid):
-            await context.bot.send_message(chat_id=cid, text=text_payload, parse_mode="Markdown")
-
-    for i, cid in enumerate(ids, start=1):
+    for cid in ids:
         try:
-            await send_func(cid)
+            if kind == "photo":
+                await context.bot.send_photo(chat_id=cid, photo=file_id, caption=caption)
+            elif kind == "video":
+                await context.bot.send_video(chat_id=cid, video=file_id, caption=caption)
+            elif kind == "animation":
+                await context.bot.send_animation(chat_id=cid, animation=file_id, caption=caption)
+            elif kind == "document":
+                await context.bot.send_document(chat_id=cid, document=file_id, caption=caption)
+            else:
+                await context.bot.send_message(chat_id=cid, text=caption)
             sent += 1
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-        if i % 25 == 0:
-            await asyncio.sleep(0.5)
 
-    await msg.reply_text(f"Рассылка завершена. Ушло: {sent}, ошибок: {fail}.")
+    await query.message.reply_text(f"✅ Рассылка завершена. Отправлено: {sent}, ошибок: {fail}")
+    return ConversationHandler.END
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.id not in ADMIN_IDS:
-        return
-    count = len(all_chat_ids())
-    await update.message.reply_text(f"Подписчиков: {count}")
+async def broadcast_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("Пришли исправленный текст и/или медиа.")
+    return BROADCAST_WAIT_CONTENT
 
-# ---------------- Запуск приложения ----------------
+async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Рассылка отменена.")
+    return ConversationHandler.END
 
+
+# ------------------------------------
+#  Запуск приложения
+# ------------------------------------
 def main():
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
-    secret = os.environ.get("WEBHOOK_SECRET", "").strip()
-    if not token or not public_url or not secret:
-        raise RuntimeError("Нужно задать BOT_TOKEN, PUBLIC_URL, WEBHOOK_SECRET.")
+    token = os.environ.get("BOT_TOKEN")
+    public_url = os.environ.get("PUBLIC_URL").rstrip("/")
+    secret = os.environ.get("WEBHOOK_SECRET")
+    if not all([token, public_url, secret]):
+        raise RuntimeError("Не заданы BOT_TOKEN / PUBLIC_URL / WEBHOOK_SECRET")
 
     app = ApplicationBuilder().token(token).build()
 
-    # пользовательские команды
-    conv = ConversationHandler(
+    # Регистрация и кнопки
+    reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             WAIT_GO: [CallbackQueryHandler(on_go_pressed, pattern="^go$")],
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
             ASK_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_count)],
         },
-        fallbacks=[CommandHandler("cancel", unsubscribe_cmd)],
+        fallbacks=[],
     )
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(on_go_pressed, pattern="^go$"))
+    app.add_handler(reg_conv)
     app.add_handler(CallbackQueryHandler(on_kaif_pressed, pattern="^kaif$"))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
 
-    # админские команды
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("stats", stats))
+    # Рассылка
+    broadcast_conv = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", broadcast_start)],
+        states={
+            BROADCAST_WAIT_CONTENT: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_collect)],
+            BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm, pattern="^confirm_broadcast$"),
+                CallbackQueryHandler(broadcast_edit, pattern="^edit_broadcast$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+    )
+    app.add_handler(broadcast_conv)
 
-    # меню команд
+    # Статистика
+    app.add_handler(CommandHandler("stats", lambda u, c: u.message.reply_text(f"Подписчиков: {len(all_chat_ids())}")))
+
+    # Меню команд
     app.post_init = post_init
 
     port = int(os.environ.get("PORT", "10000"))
