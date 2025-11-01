@@ -25,17 +25,22 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ------------------------------------
-#  Константы и состояния
-# ------------------------------------
+
+# -----------------------------------
+#  Состояния
+# -----------------------------------
 WAIT_GO, ASK_NAME, ASK_COUNT = range(3)
 BROADCAST_WAIT_CONTENT, BROADCAST_CONFIRM = range(1001, 1003)
+
+# -----------------------------------
+#  Настройки
+# -----------------------------------
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 
-# ------------------------------------
-#  Работа с Google Sheets
-# ------------------------------------
+# -----------------------------------
+#  Google Sheets
+# -----------------------------------
 def gs_client():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     if not creds_json:
@@ -44,6 +49,7 @@ def gs_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
+
 
 def gs_ws(sheet_name: str, headers: list):
     sheet_id = os.environ.get("SHEET_ID", "").strip()
@@ -58,6 +64,7 @@ def gs_ws(sheet_name: str, headers: list):
         ws.append_row(headers)
     return ws
 
+
 def add_subscriber(chat_id, username, first_name):
     ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
     existing = ws.col_values(1)
@@ -69,11 +76,13 @@ def add_subscriber(chat_id, username, first_name):
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ])
 
+
 def remove_subscriber(chat_id):
     ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
     cells = ws.findall(str(chat_id), in_column=1)
     for c in reversed(cells):
         ws.delete_rows(c.row)
+
 
 def all_chat_ids():
     ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
@@ -81,9 +90,9 @@ def all_chat_ids():
     return [int(x) for x in vals[1:] if x.isdigit()]
 
 
-# ------------------------------------
+# -----------------------------------
 #  Меню команд
-# ------------------------------------
+# -----------------------------------
 async def set_user_commands(app):
     commands = [
         BotCommand("start", "Регистрация на концерт"),
@@ -92,10 +101,11 @@ async def set_user_commands(app):
     ]
     await app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
+
 async def set_admin_commands(app, admin_ids):
     commands = [
         BotCommand("broadcast", "Создать рассылку"),
-        BotCommand("stats", "Показать статистику подписчиков"),
+        BotCommand("stats", "Показать статистику"),
         BotCommand("cancel", "Отменить рассылку"),
     ]
     for aid in admin_ids:
@@ -104,20 +114,21 @@ async def set_admin_commands(app, admin_ids):
         except Exception:
             pass
 
+
 async def post_init(app):
     await set_user_commands(app)
     await set_admin_commands(app, ADMIN_IDS)
 
 
-# ------------------------------------
-#  Пользовательские функции
-# ------------------------------------
+# -----------------------------------
+#  Регистрация пользователей
+# -----------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_subscriber(
-        chat_id=user.id if user else 0,
-        username=f"@{user.username}" if user and user.username else "",
-        first_name=user.first_name if user else "",
+        chat_id=user.id,
+        username=f"@{user.username}" if user.username else "",
+        first_name=user.first_name or "",
     )
 
     text = (
@@ -130,11 +141,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=keyboard)
     return WAIT_GO
 
+
 async def on_go_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.message.reply_text("Отлично. Подскажи, как тебя зовут")
     return ASK_NAME
+
 
 async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
@@ -145,6 +158,7 @@ async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(напиши число — если ты придёшь один/одна, то просто напиши «1»)"
     )
     return ASK_COUNT
+
 
 async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
@@ -158,6 +172,7 @@ async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = context.user_data.get("name", "")
     user = update.effective_user
+
     ws = gs_ws("Записи", ["Время", "Telegram ID", "Юзернейм", "Имя", "Количество"])
     ws.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -181,13 +196,13 @@ async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg4, reply_markup=keyboard)
     return ConversationHandler.END
 
+
 async def on_kaif_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     msg5 = (
         "Раз кайф, то подпишись на мою телегу :)\n\n"
-        "Там будут все новости по концерту — "
-        "[тык](https://t.me/+xkFENZGOXv44N2Zi)"
+        "Там будут все новости по концерту — [тык](https://t.me/+xkFENZGOXv44N2Zi)"
     )
     if os.path.exists("poster.jpg"):
         with open("poster.jpg", "rb") as f:
@@ -196,15 +211,23 @@ async def on_kaif_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(msg5, parse_mode="Markdown")
 
 
-# ------------------------------------
-#  3-шаговая рассылка с предпросмотром
-# ------------------------------------
+# -----------------------------------
+#  3-шаговая рассылка с предпросмотром и кнопкой отмены
+# -----------------------------------
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_IDS:
         return
-    await update.message.reply_text("Ок, прикрепи фото, видео или текст для рассылки. Пришли сообщение.")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Отменить рассылку", callback_data="cancel_broadcast")]
+    ])
+    await update.message.reply_text(
+        "Ок, прикрепи фото, видео или текст для рассылки.\nКогда будешь готов — просто отправь сообщение.",
+        reply_markup=keyboard,
+    )
     return BROADCAST_WAIT_CONTENT
+
 
 async def broadcast_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -223,8 +246,11 @@ async def broadcast_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.update({"kind": kind, "file_id": file_id, "caption": caption})
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Всё ок, выкладывай", callback_data="confirm_broadcast")],
-        [InlineKeyboardButton("✏️ Исправить", callback_data="edit_broadcast")],
+        [
+            InlineKeyboardButton("✅ Всё ок, выкладывай", callback_data="confirm_broadcast"),
+            InlineKeyboardButton("✏️ Исправить", callback_data="edit_broadcast"),
+        ],
+        [InlineKeyboardButton("🚫 Отменить рассылку", callback_data="cancel_broadcast")],
     ])
 
     if kind == "photo":
@@ -239,6 +265,7 @@ async def broadcast_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"ПРЕДПРОСМОТР:\n\n{caption}", reply_markup=keyboard)
 
     return BROADCAST_CONFIRM
+
 
 async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -270,20 +297,51 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"✅ Рассылка завершена. Отправлено: {sent}, ошибок: {fail}")
     return ConversationHandler.END
 
+
 async def broadcast_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("Пришли исправленный текст и/или медиа.")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Отменить рассылку", callback_data="cancel_broadcast")]
+    ])
+    await query.message.reply_text("Пришли исправленный текст и/или медиа.", reply_markup=keyboard)
     return BROADCAST_WAIT_CONTENT
 
-async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Рассылка отменена.")
+
+async def broadcast_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("🚫 Рассылка отменена.")
     return ConversationHandler.END
 
 
-# ------------------------------------
-#  Запуск приложения
-# ------------------------------------
+async def broadcast_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Рассылка отменена.")
+    return ConversationHandler.END
+
+
+def add_broadcast_handlers(app):
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", broadcast_start)],
+        states={
+            BROADCAST_WAIT_CONTENT: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_collect)],
+            BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm, pattern="^confirm_broadcast$"),
+                CallbackQueryHandler(broadcast_edit, pattern="^edit_broadcast$"),
+                CallbackQueryHandler(broadcast_cancel_button, pattern="^cancel_broadcast$"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", broadcast_cancel_command),
+            CallbackQueryHandler(broadcast_cancel_button, pattern="^cancel_broadcast$"),
+        ],
+    )
+    app.add_handler(conv)
+
+
+# -----------------------------------
+#  Основной запуск
+# -----------------------------------
 def main():
     token = os.environ.get("BOT_TOKEN")
     public_url = os.environ.get("PUBLIC_URL").rstrip("/")
@@ -293,7 +351,6 @@ def main():
 
     app = ApplicationBuilder().token(token).build()
 
-    # Регистрация и кнопки
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -306,24 +363,9 @@ def main():
     app.add_handler(reg_conv)
     app.add_handler(CallbackQueryHandler(on_kaif_pressed, pattern="^kaif$"))
 
-    # Рассылка
-    broadcast_conv = ConversationHandler(
-        entry_points=[CommandHandler("broadcast", broadcast_start)],
-        states={
-            BROADCAST_WAIT_CONTENT: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_collect)],
-            BROADCAST_CONFIRM: [
-                CallbackQueryHandler(broadcast_confirm, pattern="^confirm_broadcast$"),
-                CallbackQueryHandler(broadcast_edit, pattern="^edit_broadcast$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
-    )
-    app.add_handler(broadcast_conv)
-
-    # Статистика
+    add_broadcast_handlers(app)
     app.add_handler(CommandHandler("stats", lambda u, c: u.message.reply_text(f"Подписчиков: {len(all_chat_ids())}")))
 
-    # Меню команд
     app.post_init = post_init
 
     port = int(os.environ.get("PORT", "10000"))
@@ -335,6 +377,7 @@ def main():
         webhook_url=f"{public_url}/{secret}",
         drop_pending_updates=True,
     )
+
 
 if __name__ == "__main__":
     main()
