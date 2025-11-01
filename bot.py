@@ -8,6 +8,9 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputFile,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,12 +25,14 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ---------- Константы ----------
+# Состояния диалога
 WAIT_GO, ASK_NAME, ASK_COUNT = range(3)
 
+# Админы из переменной окружения
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-# ---------- Google Sheets ----------
+# ---------------- Google Sheets ----------------
+
 def gs_client():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     if not creds_json:
@@ -46,7 +51,7 @@ def gs_ws(sheet_name: str, headers: list):
     try:
         ws = sh.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=len(headers))
+        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=max(8, len(headers)))
         ws.append_row(headers, value_input_option="RAW")
     return ws
 
@@ -64,12 +69,45 @@ def add_subscriber(chat_id, username, first_name):
             value_input_option="RAW",
         )
 
+def remove_subscriber(chat_id):
+    ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
+    cells = ws.findall(str(chat_id), in_column=1)
+    # если несколько записей по ошибке, удалим все
+    for c in reversed(cells):
+        ws.delete_rows(c.row)
+
 def all_chat_ids():
     ws = gs_ws("Подписчики", ["chat_id", "username", "first_name", "subscribed_at"])
     vals = ws.col_values(1)
     return [int(x) for x in vals[1:] if x.isdigit()]
 
-# ---------- Хэндлеры ----------
+# ---------------- Меню команд ----------------
+
+async def set_user_commands(app):
+    commands = [
+        BotCommand("start", "Регистрация на концерт"),
+        BotCommand("help", "Помощь и контакты"),
+        BotCommand("unsubscribe", "Отписаться от уведомлений"),
+    ]
+    await app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+
+async def set_admin_commands(app, admin_ids):
+    commands = [
+        BotCommand("broadcast", "Рассылка всем подписчикам"),
+        BotCommand("stats", "Статистика подписчиков"),
+    ]
+    for aid in admin_ids:
+        try:
+            await app.bot.set_my_commands(commands, scope=BotCommandScopeChat(aid))
+        except Exception:
+            pass
+
+async def post_init(app):
+    await set_user_commands(app)
+    await set_admin_commands(app, ADMIN_IDS)
+
+# ---------------- Хэндлеры пользователя ----------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     add_subscriber(
@@ -85,7 +123,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Кликни \"Я иду!\", чтобы зарегистрироваться"
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Я иду!", callback_data="go")]])
-    await update.message.reply_text(text, reply_markup=keyboard)
+    if update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.callback_query.message.reply_text(text, reply_markup=keyboard)
     return WAIT_GO
 
 async def on_go_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,21 +202,62 @@ async def on_kaif_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await q.message.reply_text(msg5, parse_mode="Markdown")
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Помощь:\n"
+        "/start — регистрация на концерт\n"
+        "/unsubscribe — отписаться от уведомлений\n"
+        "Новости и анонсы приходят в рассылке."
+    )
+
+async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user:
+        remove_subscriber(user.id)
+    await update.message.reply_text("Ты отписан от уведомлений. Вернуть рассылку можно командой /start.")
+
+# ---------------- Админ-хэндлеры ----------------
+
+def _extract_broadcast_payload(msg):
+    if msg.caption and msg.caption.startswith("/broadcast"):
+        return msg.caption.partition(" ")[2].strip()
+    if msg.text and msg.text.startswith("/broadcast"):
+        return msg.text.partition(" ")[2].strip()
+    return ""
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_IDS:
         return
-    raw = update.message.text if update.message else ""
-    text = raw.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("Используй: /broadcast ваш текст")
+
+    msg = update.message
+    text_payload = _extract_broadcast_payload(msg)
+    if not any([msg.photo, msg.video, msg.document]) and not text_payload:
+        await msg.reply_text("Используй: /broadcast текст сообщения. Можно прикрепить фото/видео с подписью.")
         return
 
     ids = all_chat_ids()
     sent, fail = 0, 0
+
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        async def send_func(cid):
+            await context.bot.send_photo(chat_id=cid, photo=file_id, caption=text_payload or " ", parse_mode="Markdown")
+    elif msg.video:
+        file_id = msg.video.file_id
+        async def send_func(cid):
+            await context.bot.send_video(chat_id=cid, video=file_id, caption=text_payload or " ", parse_mode="Markdown")
+    elif msg.document:
+        file_id = msg.document.file_id
+        async def send_func(cid):
+            await context.bot.send_document(chat_id=cid, document=file_id, caption=text_payload or " ", parse_mode="Markdown")
+    else:
+        async def send_func(cid):
+            await context.bot.send_message(chat_id=cid, text=text_payload, parse_mode="Markdown")
+
     for i, cid in enumerate(ids, start=1):
         try:
-            await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+            await send_func(cid)
             sent += 1
         except Exception:
             fail += 1
@@ -183,13 +265,17 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if i % 25 == 0:
             await asyncio.sleep(0.5)
 
-    await update.message.reply_text(f"Рассылка завершена. Ушло: {sent}, ошибок: {fail}.")
+    await msg.reply_text(f"Рассылка завершена. Ушло: {sent}, ошибок: {fail}.")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Регистрация отменена.")
-    return ConversationHandler.END
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+    count = len(all_chat_ids())
+    await update.message.reply_text(f"Подписчиков: {count}")
 
-# ---------- Основной запуск ----------
+# ---------------- Запуск приложения ----------------
+
 def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
@@ -199,6 +285,7 @@ def main():
 
     app = ApplicationBuilder().token(token).build()
 
+    # пользовательские команды
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -206,12 +293,20 @@ def main():
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
             ASK_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_count)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", unsubscribe_cmd)],
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_go_pressed, pattern="^go$"))
     app.add_handler(CallbackQueryHandler(on_kaif_pressed, pattern="^kaif$"))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
+
+    # админские команды
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("stats", stats))
+
+    # меню команд
+    app.post_init = post_init
 
     port = int(os.environ.get("PORT", "10000"))
     app.run_webhook(
